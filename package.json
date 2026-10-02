@@ -42,6 +42,7 @@
     "bin/camofox-browser.js",
     "lib/",
     "mcp/server.mjs",
+    "mcp/package.json",
     "mcp/lib/config.mjs",
     "mcp/lib/cookies.mjs",
     "mcp/lib/tool-contracts.mjs",
