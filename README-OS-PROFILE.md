@@ -75,8 +75,11 @@ profile 目录首次使用时自动 `mkdir -p`。默认 `~/.camofox/os-profiles`
 ```bash
 npx jest tests/unit/osProfile.test.js     # 新增：路径解析/存活探测/源码契约
 npx jest tests/unit/launchCompat.test.js  # 契约已更新（launch 签名 + os 分支断言）
-npm run test:unit                          # 全量回归
+npm run test:unit                          # 全量回归（66 suites / 833 tests 绿）
+node tests/smoke/os-profile-smoke.mjs      # 实机冒烟：9/9 通过（真实 Camoufox 二进制）
 ```
+
+实机冒烟覆盖：`/health` → 建表 → evaluate 设 cookie+localStorage → **服务完整重启后两者存活**（零注入）→ 第二 userId 隔离验证 → profile 目录复用断言。注意 localStorage 落盘依赖 Firefox LSNG 的 5 秒 flush 间隔，冒烟脚本在关停前等待 8 秒。
 
 ## 与上游的差异面（供 PR review）
 
