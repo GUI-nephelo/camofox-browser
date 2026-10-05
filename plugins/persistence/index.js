@@ -49,6 +49,14 @@ async function removeIfExists(p) {
 export async function register(app, ctx, pluginConfig = {}) {
   const { events, config, log } = ctx;
 
+  // os-profile mode: state lives in each user's Firefox profile on disk; the
+  // storageState hooks below would inject state over the protocol and defeat
+  // the zero-injection property, so everything early-exits.
+  if (ctx.launchMode === 'os-profile') {
+    log('info', 'persistence plugin: storageState hooks disabled (os-profile mode)');
+    return;
+  }
+
   // Resolve profileDir: env var > plugin config > global config default (~/.camofox/profiles)
   const profileDir = process.env.CAMOFOX_PROFILE_DIR || pluginConfig.profileDir || config.profileDir;
   if (!profileDir) {

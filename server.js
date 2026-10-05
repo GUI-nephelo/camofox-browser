@@ -10,6 +10,7 @@ import { getSearchFallbacks } from './lib/search-fallbacks.js';
 import { hasGoogleOrganicResults } from './lib/google-serp.js';
 import { loadConfig } from './lib/config.js';
 import { contextIdentityOptions, launchLocale } from './lib/browser-identity.js';
+import { osProfilePathFor, ensureOsProfileDir, isOsProfileAlive } from './lib/os-profile.js';
 import { normalizePlaywrightProxy, createProxyPool, buildProxyUrl } from './lib/proxy.js';
 import { createFlyHelpers } from './lib/fly.js';
 import { createPluginEvents, loadPlugins, typeEventPayload } from './lib/plugins.js';
@@ -907,6 +908,23 @@ function getExternalCamoufoxLaunch() {
 async function probeGoogleSearch(candidateBrowser) {
   let context = null;
   try {
+    if (OS_PROFILE_MODE) {
+      // candidateBrowser is a persistent context; probe through a throwaway page.
+      context = candidateBrowser;
+      const page = await context.newPage();
+      await page.goto('https://www.google.com/', { waitUntil: 'domcontentloaded', timeout: 30000 });
+      await page.waitForTimeout(1200);
+      await page.goto('https://www.google.com/search?q=weather%20today', { waitUntil: 'domcontentloaded', timeout: 30000 });
+      await page.waitForTimeout(4000);
+      const blocked = await isGoogleSearchBlocked(page);
+      const result = {
+        ok: !blocked && isGoogleSerp(page.url()),
+        url: page.url(),
+        blocked,
+      };
+      await safePageClose(page);
+      return result;
+    }
     context = await candidateBrowser.newContext({
       viewport: null,
       ...contextIdentityOptions({
@@ -963,6 +981,16 @@ async function closeBrowserFully(reason) {
 }
 
 async function _closeBrowserFullyImpl(reason) {
+  if (OS_PROFILE_MODE) {
+    // Each user's Firefox process is closed through its own persistent
+    // context (closeSession). Here we only reset the shared handle state.
+    clearBrowserIdleTimer();
+    _lastBrowserStopReason = reason;
+    browser = null;
+    _lastBrowserPid = null;
+    osProfileLaunches.clear();
+    return;
+  }
   const b = browser;
   if (!b) return;
   clearBrowserIdleTimer();
@@ -1122,7 +1150,38 @@ async function buildLaunchOptionsWithGeoipFallback(baseOptions, attemptMeta) {
   }
 }
 
-async function launchBrowserInstance() {
+const OS_PROFILE_MODE = CONFIG.persistenceMode === 'os-profile';
+
+// os-profile mode: userId -> launch promise (single-flight per user). Each
+// launch creates its own Firefox process rooted at the user's profile dir.
+const osProfileLaunches = new Map();
+
+async function launchPersistentContextForUser(userId, options, localVirtualDisplay) {
+  const userDataDir = osProfilePathFor({
+    osProfileDir: CONFIG.osProfileDir,
+    primaryProfileDir: CONFIG.primaryProfileDir,
+    primaryUserId: CONFIG.primaryUserId,
+    userId,
+  });
+  await ensureOsProfileDir(userDataDir);
+  const context = await firefox.launchPersistentContext(userDataDir, options);
+  attachOsProfileCleanup(userId, context, localVirtualDisplay);
+  return context;
+}
+
+function attachOsProfileCleanup(userId, context, localVirtualDisplay) {
+  const origClose = context.close.bind(context);
+  context.close = async (...args) => {
+    await origClose(...args);
+    osProfileLaunches.delete(userId);
+    if (localVirtualDisplay) {
+      localVirtualDisplay.kill();
+      if (virtualDisplay === localVirtualDisplay) virtualDisplay = null;
+    }
+  };
+}
+
+async function launchBrowserInstance(userId = '__primary__') {
   const hostOS = getHostOS();
   const maxAttempts = proxyPool?.launchRetries ?? 1;
   let lastError = null;
@@ -1196,6 +1255,32 @@ async function launchBrowserInstance() {
       options.handleSIGHUP = false;
       await pluginEvents.emitAsync('browser:launching', { options });
 
+      if (OS_PROFILE_MODE) {
+        candidateBrowser = await launchPersistentContextForUser(userId, options, localVirtualDisplay);
+        virtualDisplay = localVirtualDisplay;
+        browserLaunchProxy = launchProxy;
+        _lastBrowserStopReason = null;
+        _lastBrowserRestartAt = Date.now();
+        // The primary user's persistent context doubles as the tracked
+        // "browser" for /health, RSS pressure and idle shutdown semantics;
+        // other users' processes are tracked via their own contexts.
+        browser = candidateBrowser.browser?.() ?? null;
+        _lastBrowserPid = null; // browser.process() was removed in playwright 1.62
+        pluginEvents.emit('browser:launched', { browser, display: vdDisplay });
+        log('info', 'camoufox persistent context launched', {
+          userId,
+          userDataDir: osProfilePathFor({
+            osProfileDir: CONFIG.osProfileDir,
+            primaryProfileDir: CONFIG.primaryProfileDir,
+            primaryUserId: CONFIG.primaryUserId,
+            userId,
+          }),
+          virtualDisplay: useVirtualDisplay,
+          interactiveMode: CONFIG.interactiveMode,
+        });
+        return candidateBrowser;
+      }
+
       candidateBrowser = await firefox.launch(options);
 
       if (proxyPool?.canRotateSessions) {
@@ -1256,8 +1341,19 @@ async function launchBrowserInstance() {
   throw lastError || new Error('Failed to launch a usable browser');
 }
 
-async function ensureBrowser() {
+async function ensureBrowser(userId = null) {
   clearBrowserIdleTimer();
+  if (OS_PROFILE_MODE) {
+    const key = normalizeUserId(userId ?? CONFIG.primaryUserId ?? '__primary__');
+    if (osProfileLaunches.has(key)) return osProfileLaunches.get(key);
+    const launchTimeoutMs = proxyPool?.launchTimeoutMs ?? 60000;
+    const launch = Promise.race([
+      launchBrowserInstance(key),
+      new Promise((_, reject) => setTimeout(() => reject(new Error(`Browser launch timeout (${Math.round(launchTimeoutMs / 1000)}s)`)), launchTimeoutMs)),
+    ]).finally(() => { osProfileLaunches.delete(key); });
+    osProfileLaunches.set(key, launch);
+    return launch;
+  }
   if (_browserClosePromise) {
     await _browserClosePromise;
   }
@@ -1329,7 +1425,16 @@ async function closeSession(userId, session, {
     }
   }
 
+  // os-profile mode: the session context IS the persistent context, so
+  // closing it terminates the user's whole Firefox process (intentional).
   await session.context.close().catch(() => {});
+  osProfileLaunches.delete(key);
+  if (OS_PROFILE_MODE) {
+    const contextBrowser = session.context.browser?.() ?? null;
+    if (contextBrowser && contextBrowser === browser) {
+      browser = null;
+    }
+  }
   sessions.delete(key);
   await pluginEvents.emitAsync('session:destroyed', { userId: key, reason });
 
@@ -1348,10 +1453,13 @@ async function getSession(userId, { trace = false } = {}) {
   let session = sessions.get(key);
   
   // Check if existing session's context is still alive
-  if (session) {
-    if (session._closing) {
-      // Session is being torn down by reaper/expiry -- treat as dead
-      session = null;
+  if (session && !session._closing) {
+    if (OS_PROFILE_MODE) {
+      if (!isOsProfileAlive(session.context)) {
+        log('warn', 'session context dead, recreating', { userId: key });
+        await closeSession(key, session, { reason: 'dead_context', clearDownloads: true, clearLocks: true });
+        session = null;
+      }
     } else {
       try {
         // Lightweight probe: pages() is synchronous-ish and throws if context is dead
@@ -1389,7 +1497,7 @@ async function getSession(userId, { trace = false } = {}) {
           );
         }
       }
-      const b = await ensureBrowser();
+      const b = await ensureBrowser(key);
       const contextOptions = {
         viewport: null,
         ...contextIdentityOptions({
@@ -1408,7 +1516,7 @@ async function getSession(userId, { trace = false } = {}) {
         log('info', 'session proxy assigned', { userId: key, proxy: sessionProxy.server });
       }
       await pluginEvents.emitAsync('session:creating', { userId: key, contextOptions });
-      const context = await b.newContext(contextOptions);
+      const context = OS_PROFILE_MODE ? b : await b.newContext(contextOptions);
 
       let tracePath = null;
       if (trace) {
@@ -6502,7 +6610,11 @@ app.post('/tabs/open', async (req, res) => {
  */
 app.post('/start', async (req, res) => {
   try {
-    await ensureBrowser();
+    if (OS_PROFILE_MODE) {
+      await ensureBrowser(req.body?.userId ?? CONFIG.primaryUserId ?? '__primary__');
+    } else {
+      await ensureBrowser();
+    }
     res.json({ ok: true, profile: 'camoufox' });
   } catch (err) {
     failuresTotal.labels('browser_launch', 'start').inc();
@@ -7081,17 +7193,32 @@ setInterval(async () => {
     log('warn', 'health probe forced despite active ops', { activeOps: healthState.activeOps, timeSinceSuccessMs: timeSinceSuccess });
   }
   
-  let testContext;
+  let testPage;
   try {
-    testContext = await browser.newContext({ viewport: null });
-    const page = await testContext.newPage();
-    await page.goto('about:blank', { timeout: 5000 });
-    await page.close();
-    await testContext.close();
-    healthState.lastSuccessfulNav = Date.now();
+    if (OS_PROFILE_MODE) {
+      // Persistent contexts cannot create extra contexts; probe through the
+      // primary user's own context instead.
+      const primarySession = sessions.get(normalizeUserId(CONFIG.primaryUserId || '__primary__'));
+      if (!primarySession || !isOsProfileAlive(primarySession.context)) {
+        throw new Error('primary os-profile context unavailable');
+      }
+      testPage = await primarySession.context.newPage();
+      await testPage.goto('about:blank', { timeout: 5000 });
+      await safePageClose(testPage);
+      testPage = null;
+      healthState.lastSuccessfulNav = Date.now();
+    } else {
+      testContext = await browser.newContext({ viewport: null });
+      const page = await testContext.newPage();
+      await page.goto('about:blank', { timeout: 5000 });
+      await page.close();
+      await testContext.close();
+      healthState.lastSuccessfulNav = Date.now();
+    }
   } catch (err) {
     failuresTotal.labels('health_probe', 'internal').inc();
     log('warn', 'health probe failed', { error: err.message, timeSinceSuccessMs: timeSinceSuccess });
+    if (testPage) await safePageClose(testPage).catch(() => {});
     if (testContext) await testContext.close().catch(() => {});
     restartBrowser('health probe failed').catch(() => {});
   }
@@ -7162,6 +7289,13 @@ pluginEvents.emit('server:starting', { port: PORT });
 const pluginCtx = {
   sessions,
   config: CONFIG,
+  launchMode: CONFIG.persistenceMode,
+  osProfilePathFor: (userId) => osProfilePathFor({
+    osProfileDir: CONFIG.osProfileDir,
+    primaryProfileDir: CONFIG.primaryProfileDir,
+    primaryUserId: CONFIG.primaryUserId,
+    userId,
+  }),
   log,
   events: pluginEvents,
   auth: authMiddleware,

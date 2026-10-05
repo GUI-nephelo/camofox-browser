@@ -59,8 +59,8 @@ describe('launch compatibility source contract', () => {
       'let sessionProxy = null;'
     );
     const launchBrowser = sourceBetween(
-      'async function launchBrowserInstance()',
-      'async function ensureBrowser()'
+      'async function launchBrowserInstance(',
+      'async function ensureBrowser('
     );
 
     expect(`${probeOptions}\n${sessionContextOptions}`).toContain('contextIdentityOptions({');
@@ -71,8 +71,8 @@ describe('launch compatibility source contract', () => {
 
   test('uses a real desktop window only when interactive desktop mode is explicit', () => {
     const launch = sourceBetween(
-      'async function launchBrowserInstance()',
-      'async function ensureBrowser()'
+      'async function launchBrowserInstance(',
+      'async function ensureBrowser('
     );
 
     expect(launch).toContain("const useDesktopWindow = CONFIG.interactiveMode === 'desktop'");
@@ -83,11 +83,11 @@ describe('launch compatibility source contract', () => {
   test('falls back when optional GeoIP setup is unavailable', () => {
     const geoipFallback = sourceBetween(
       'function isCamoufoxGeoipError',
-      'async function launchBrowserInstance()'
+      'async function launchBrowserInstance('
     );
     const launchBrowser = sourceBetween(
-      'async function launchBrowserInstance()',
-      'async function ensureBrowser()'
+      'async function launchBrowserInstance(',
+      'async function ensureBrowser('
     );
 
     expect(geoipFallback).toMatch(/GeoLite\|MaxMind\|geolocation/);
@@ -105,6 +105,33 @@ describe('launch compatibility source contract', () => {
     );
 
     expect(healthProbeOptions).toContain('viewport: null');
+  });
+
+  test('routes os-profile mode through launchPersistentContext', () => {
+    const launchBrowser = sourceBetween(
+      'async function launchBrowserInstance(',
+      'async function ensureBrowser('
+    );
+
+    expect(launchBrowser).toContain('if (OS_PROFILE_MODE) {');
+    expect(launchBrowser).toContain('launchPersistentContextForUser(userId, options, localVirtualDisplay)');
+    expect(launchBrowser).toContain('candidateBrowser = await firefox.launch(options)');
+    expect(launchBrowser).toContain('browser = candidateBrowser.browser?.() ?? null');
+    expect(serverSource).toContain('async function launchPersistentContextForUser(userId, options, localVirtualDisplay)');
+    expect(serverSource).toContain('firefox.launchPersistentContext(userDataDir, options)');
+    expect(serverSource).toContain('osProfileLaunches.delete(key);');
+    expect(serverSource).toContain('launchMode: CONFIG.persistenceMode');
+  });
+
+  test('os-profile health probe uses the primary user context instead of newContext', () => {
+    const healthProbe = sourceBetween(
+      '// Active health probe',
+      '// Crash logging'
+    );
+
+    expect(healthProbe).toContain('if (OS_PROFILE_MODE) {');
+    expect(healthProbe).toContain("primary os-profile context unavailable");
+    expect(healthProbe).toContain('testContext = await browser.newContext({ viewport: null })');
   });
 
   test('uses the configured navigation timeout without racing its request deadline', () => {
