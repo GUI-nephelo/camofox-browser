@@ -4,6 +4,7 @@
   "version": "1.6.0",
   "newPageTimeoutMs": 10000,
   "interactive": { "mode": "off" },
+  "persistence": { "mode": "storageState" },
   "plugins": {
     "youtube": { "enabled": true },
     "persistence": { "enabled": true },
